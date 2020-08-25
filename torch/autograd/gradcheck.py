@@ -53,38 +53,48 @@ def get_numerical_jacobian(fn, input, target=None, eps=1e-3):
     if target is None:
         target = input
     output_size = fn(input).numel()
-    jacobian = make_jacobian(target, output_size)
-
+    w_jacobian = make_jacobian(target, output_size)
+    conj_w_jacobian = make_jacobian(target, output_size)
     # It's much easier to iterate over flattened lists of tensors.
     # These are reference to the same objects in jacobian, so any changes
     # will be reflected in it as well.
     x_tensors = iter_tensors(target, True)
-    j_tensors = iter_tensors(jacobian)
+    w_j_tensors = iter_tensors(w_jacobian)
+    conj_w_j_tensors = iter_tensors(conj_w_jacobian)
 
-    def compute_gradient(x, idx, is_mkldnn=False):
+    def update_jacobians(x, idx, d, conj_d, d_idx, is_mkldnn=False):
 
-        def fn_out():
-            if not is_mkldnn:
-                # x is a view into input and so this works
-                return fn(input).clone()
-            else:
-                # convert the dense tensor back to have mkldnn layout
-                return fn([x.to_mkldnn()])
+        def compute_gradient(delta=eps):
+            def fn_out():
+                if not is_mkldnn:
+                    # x is a view into input and so this works
+                    return fn(input).clone()
+                else:
+                    # convert the dense tensor back to have mkldnn layout
+                    return fn([x.to_mkldnn()])
 
-        orig = x[idx].item()
-        x[idx] = orig - eps
-        outa = fn_out()
-        x[idx] = orig + eps
-        outb = fn_out()
-        x[idx] = orig
-        r = (outb - outa) / (2 * eps)
-        return r.detach().reshape(-1)
+            orig = x[idx].item()
+            x[idx] = orig - delta
+            outa = fn_out()
+            x[idx] = orig + delta
+            outb = fn_out()
+            x[idx] = orig
+            r = (outb - outa) / (2 * eps)
+            return r.detach().reshape(-1)
+
+        ds_dx = compute_gradient(delta=eps)
+        if x.is_complex():
+            ds_dy = compute_gradient(delta=(eps * 1j))
+            d[d_idx] = 0.5 * (ds_dx - ds_dy * 1j)
+            conj_d[d_idx] = 0.5 * (ds_dx + ds_dy * 1j)
+        else:
+            d[d_idx] = 0.5 * ds_dx
+            conj_d[d_idx] = 0.5 * ds_dx
 
     # TODO: compare structure
-    for x_tensor, d_tensor in zip(x_tensors, j_tensors):
+    for x_tensor, d_tensor, conj_d_tensor in zip(x_tensors, w_j_tensors, conj_w_j_tensors):
         is_complex = x_tensor.dtype.is_complex
-        if is_complex:
-            eps *= (1 + 1j)
+
         if x_tensor.is_sparse:
             def get_stride(size):
                 dim = len(size)
@@ -109,7 +119,7 @@ def get_numerical_jacobian(fn, input, target=None, eps=1e-3):
                 for x_idx in product(*[range(m) for m in x_values.size()[1:]]):
                     indices = x_indices[i].tolist() + list(x_idx)
                     d_idx = sum(indices[k] * x_stride[k] for k in range(len(x_size)))
-                    d_tensor[d_idx] = compute_gradient(x_value, x_idx)
+                    update_jacobians(x_value, x_idx, d_tensor, conj_d_tensor, d_idx)
         elif x_tensor.layout == torch._mkldnn:
             # Use .data here to get around the version check
             x_tensor = x_tensor.data
@@ -120,14 +130,14 @@ def get_numerical_jacobian(fn, input, target=None, eps=1e-3):
                 # this is really inefficient, but without indexing implemented, there's
                 # not really a better way than converting back and forth
                 x_tensor_dense = x_tensor.to_dense()
-                d_tensor[d_idx] = compute_gradient(x_tensor_dense, x_idx, is_mkldnn=True)
+                update_jacobians(x_tensor_dense, x_idx, d_tensor, conj_d_tensor, d_idx, is_mkldnn=True)
         else:
             # Use .data here to get around the version check
             x_tensor = x_tensor.data
             for d_idx, x_idx in enumerate(product(*[range(m) for m in x_tensor.size()])):
-                d_tensor[d_idx] = compute_gradient(x_tensor, x_idx)
+                update_jacobians(x_tensor, x_idx, d_tensor, conj_d_tensor, d_idx)
 
-    return jacobian
+        return w_jacobian, conj_w_jacobian
 
 
 def get_analytical_jacobian(input, output, nondet_tol=0.0):
@@ -286,8 +296,9 @@ def gradcheck(
         for i, o in enumerate(func_out):
             def fn(input):
                 return _as_tuple(func(*input))[i]
-            numerical = get_numerical_jacobian(fn, tupled_inputs, eps=eps)
-            for n in numerical:
+            numerical_w, numerical_conj_w = get_numerical_jacobian(fn, tupled_inputs, eps=eps)[0]
+            # TODO: update this to also include check for numerical_conj_w
+            for n in numerical_w:
                 if torch.ne(n, 0).sum() > 0:
                     return fail_test('Numerical gradient for function expected to be zero')
         return True
@@ -300,17 +311,17 @@ def gradcheck(
             return _as_tuple(func(*input))[i]
 
         analytical, reentrant, correct_grad_sizes = get_analytical_jacobian(tupled_inputs, o, nondet_tol=nondet_tol)
-        numerical = get_numerical_jacobian(fn, tupled_inputs, eps=eps)
+        numerical_w, numerical_conj_w = get_numerical_jacobian(fn, tupled_inputs, eps=eps)
 
         if not correct_grad_sizes:
             return fail_test('Analytical gradient has incorrect size')
 
-        for j, (a, n) in enumerate(zip(analytical, numerical)):
-            if a.numel() != 0 or n.numel() != 0:
-                if not torch.allclose(a, n, rtol, atol):
+        for j, (a, n_w, n_conj_w, inp) in enumerate(zip(analytical, numerical_w, numerical_conj_w, tupled_inputs)):
+            if a.numel() != 0 or n_re.numel() != 0:
+                dL_dz_conj = n_conj_w + n_w.conj()
+                if not torch.allclose(a, dL_dz_conj, rtol, atol):
                     return fail_test('Jacobian mismatch for output %d with respect to input %d,\n'
-                                     'numerical:%s\nanalytical:%s\n' % (i, j, n, a))
-
+                                     'numerical:%s\nanalytical:%s\n' % (i, j, dL_dz_conj, a))
         if not reentrant:
             return fail_test('Backward is not reentrant, i.e., running backward with same '
                              'input and grad_output multiple times gives different values, '
