@@ -157,6 +157,7 @@ class class_ {
   ///            return c10::make_intrusive<MyStackClass<std::string>>(
   ///               std::vector<std::string>{"i", "was", "deserialized"});
   ///         })
+  /// TODO(before land): update the above doc
   template <typename GetStateFn, typename SetStateFn>
   class_& def_pickle(GetStateFn&& get_state, SetStateFn&& set_state) {
     static_assert(
@@ -207,16 +208,17 @@ class class_ {
         getstate_schema.returns().size() == 1,
         "__getstate__ should return exactly one value for serialization. Got: ",
         format_getstate_schema());
+
     auto ser_type = getstate_schema.returns().at(0).type();
     auto setstate_schema = classTypePtr->getMethod("__setstate__").getSchema();
     auto arg_type = setstate_schema.arguments().at(1).type();
     TORCH_CHECK(
-        (*arg_type == *ser_type),
-        "__setstate__'s argument should be the same type as the "
-        "return value of __getstate__. Got ",
-        arg_type->repr_str(),
+        ser_type->isSubtypeOf(arg_type),
+        "__getstate__'s return type should be a subtype of "
+        "input argument of __setstate__. Got ",
+        ser_type->repr_str(),
         " but expected ",
-        ser_type->repr_str());
+        arg_type->repr_str());
 
     return *this;
   }
