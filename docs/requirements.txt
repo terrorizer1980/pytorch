@@ -3,3 +3,5 @@ sphinx==2.4.4
 sphinxcontrib.katex
 matplotlib
 tensorboard
+pygments>=2.7.4 # not directly required, pinned by Snyk to avoid a vulnerability
+rsa>=4.7 # not directly required, pinned by Snyk to avoid a vulnerability
