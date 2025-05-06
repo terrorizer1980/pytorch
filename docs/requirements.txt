@@ -3,3 +3,4 @@ sphinx==2.4.4
 sphinxcontrib.katex
 matplotlib
 tensorboard
+setuptools>=78.1.1 # not directly required, pinned by Snyk to avoid a vulnerability
